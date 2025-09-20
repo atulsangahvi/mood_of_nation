@@ -45,7 +45,6 @@ jobs:
           echo "LANG=${{ github.event.inputs.lang }}" >> $GITHUB_ENV
           echo "DAYS=${{ github.event.inputs.days }}" >> $GITHUB_ENV
           echo "LIMIT=${{ github.event.inputs.limit }}" >> $GITHUB_ENV
-          # Fallbacks if inputs are empty:
           echo 'TOPICS=${TOPICS:-vote chori, stock market}' >> $GITHUB_ENV
           echo 'LANG=${LANG:-en}' >> $GITHUB_ENV
           echo 'DAYS=${DAYS:-2}' >> $GITHUB_ENV
