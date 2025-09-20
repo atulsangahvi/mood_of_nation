@@ -34,7 +34,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify script exists
+      - name: Verify script exists at repo root
         run: |
           ls -la
           test -f scrape.py || (echo "scrape.py not found at repo root" && exit 1)
@@ -45,7 +45,7 @@ jobs:
           echo "LANG=${{ github.event.inputs.lang }}" >> $GITHUB_ENV
           echo "DAYS=${{ github.event.inputs.days }}" >> $GITHUB_ENV
           echo "LIMIT=${{ github.event.inputs.limit }}" >> $GITHUB_ENV
-          # Shell fallbacks if inputs are empty:
+          # Fallbacks if inputs are empty:
           echo 'TOPICS=${TOPICS:-vote chori, stock market}' >> $GITHUB_ENV
           echo 'LANG=${LANG:-en}' >> $GITHUB_ENV
           echo 'DAYS=${DAYS:-2}' >> $GITHUB_ENV
@@ -65,7 +65,7 @@ jobs:
         run: |
           python -V
           pip -V
-          python -c "import snscrape, pandas; print('snscrape OK', snscrape.__version__); print('pandas OK', pandas.__version__)"
+          python -c "import snscrape, pandas; print('snscrape OK'); print('pandas OK', pandas.__version__)"
 
       - name: Run scrape on default branch
         run: |
