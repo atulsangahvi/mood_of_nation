@@ -8,7 +8,7 @@ on:
         required: false
         default: "vote chori, stock market"
       lang:
-        description: "Language filter"
+        description: "Language (en/hi/blank)"
         required: false
         default: "en"
       days:
@@ -27,17 +27,31 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Create or switch to data-cache branch
+      - name: Verify script exists
         run: |
-          git checkout data-cache || git checkout -b data-cache
+          ls -la
+          test -f scrape.py || (echo "scrape.py not found at repo root" && exit 1)
 
-      - name: Set up Python
+      - name: Set defaults from inputs
+        run: |
+          echo "TOPICS=${{ github.event.inputs.topics }}" >> $GITHUB_ENV
+          echo "LANG=${{ github.event.inputs.lang }}" >> $GITHUB_ENV
+          echo "DAYS=${{ github.event.inputs.days }}" >> $GITHUB_ENV
+          echo "LIMIT=${{ github.event.inputs.limit }}" >> $GITHUB_ENV
+          # Shell fallbacks if inputs are empty:
+          echo 'TOPICS=${TOPICS:-vote chori, stock market}' >> $GITHUB_ENV
+          echo 'LANG=${LANG:-en}' >> $GITHUB_ENV
+          echo 'DAYS=${DAYS:-2}' >> $GITHUB_ENV
+          echo 'LIMIT=${LIMIT:-800}' >> $GITHUB_ENV
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -53,20 +67,31 @@ jobs:
           pip -V
           python -c "import snscrape, pandas; print('snscrape OK', snscrape.__version__); print('pandas OK', pandas.__version__)"
 
-      - name: Run scrape
+      - name: Run scrape on default branch
         run: |
           python scrape.py \
-            --topics "${{ github.event.inputs.topics || 'vote chori, stock market' }}" \
-            --lang "${{ github.event.inputs.lang || 'en' }}" \
-            --days "${{ github.event.inputs.days || '2' }}" \
-            --limit "${{ github.event.inputs.limit || '800' }}" \
+            --topics "${TOPICS}" \
+            --lang "${LANG}" \
+            --days "${DAYS}" \
+            --limit "${LIMIT}" \
             --outdir data
 
-      - name: List outputs
-        run: ls -lh data || true
-
-      - name: Commit and push data
+      - name: Stage outputs aside
         run: |
+          ls -lh data || true
+          mkdir -p /tmp/out
+          cp -r data /tmp/out/data
+
+      - name: Switch to or create data-cache branch
+        run: |
+          git fetch origin data-cache || true
+          git checkout data-cache || git checkout -b data-cache
+
+      - name: Copy outputs into data-cache and push
+        run: |
+          mkdir -p data
+          cp -r /tmp/out/data/* data/ || true
+          ls -lh data || true
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/*.csv || true
