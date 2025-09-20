@@ -1,0 +1,60 @@
+
+name: scrape-twitter-topics
+
+on:
+  workflow_dispatch:
+    inputs:
+      topics:
+        description: "Comma-separated topics (e.g., vote chori, stock market)"
+        required: false
+        default: "vote chori, stock market"
+      lang:
+        description: "Language filter"
+        required: false
+        default: "en"
+      days:
+        description: "Lookback days"
+        required: false
+        default: "2"
+      limit:
+        description: "Max tweets"
+        required: false
+        default: "800"
+  schedule:
+    - cron: "0 * * * *"   # hourly
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # allow pushing CSVs back to repo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install snscrape pandas
+
+      - name: Run scrape
+        run: |
+          python scrape.py \
+            --topics "${{ github.event.inputs.topics || 'vote chori, stock market' }}" \
+            --lang "${{ github.event.inputs.lang || 'en' }}" \
+            --days "${{ github.event.inputs.days || '2' }}" \
+            --limit "${{ github.event.inputs.limit || '800' }}" \
+            --outdir data
+
+      - name: Commit and push data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.csv || true
+          git commit -m "Update scraped CSVs [skip ci]" || echo "Nothing to commit"
+          git push
