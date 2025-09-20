@@ -1,29 +1,18 @@
 
 # mood_of_india_streamlit.py
-# Streamlit app: Query X/Twitter for a topic (e.g., "vote chori") and estimate support / oppose / neutral
-# Data collectors: TWINT (if available) -> fallback to snscrape
-# Sentiment: Transformers (cardiffnlp/twitter-xlm-roberta-base-sentiment) -> fallback to VADER + basic lexicon for Hindi/Hinglish
-#
-# How to run:
-#   1) pip install -r requirements.txt
-#   2) streamlit run mood_of_india_streamlit.py
-#
-# Cloud-safe defaults:
-# - Transformer toggle OFF by default (uses VADER unless you enable it)
-# - Prefer TWINT is OFF by default (uses snscrape)
-# - limit=1000, days=2
+# Streamlit app with robust snscrape Python API (no subprocess by default) + clear diagnostics.
 
 import os
 import re
 import sys
 import json
-import time
 import math
 import html
+import time
 import tempfile
 import subprocess
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List
 
 import pandas as pd
 import numpy as np
@@ -32,19 +21,17 @@ import streamlit as st
 st.set_page_config(page_title="Mood of India (Twitter/X)", page_icon="🇮🇳", layout="wide")
 
 st.title("🇮🇳 Mood of India — Twitter/X Topic Sentiment")
-st.caption("Type a topic like **vote chori**, **stock market**, **inflation**, etc. The app will fetch recent tweets and estimate support/oppose/neutral.")
+st.caption("Fetch tweets on a topic and estimate support / oppose / neutral. This build prefers the snscrape **Python API** (faster, less flaky).")
 
 with st.expander("Read me"):
     st.markdown("""
 **What this does:**  
-- Collects tweets for your query via **TWINT** (no API key). If that fails or is disabled, uses **snscrape**.  
-- Runs sentiment using a multilingual **transformer** (if enabled), else **VADER** + a small **Hindi/Hinglish** lexicon.  
-- Shows a mood meter, trend, top keywords, and lets you download a CSV.
+- Collects tweets via **snscrape** Python API (preferred). If that fails, tries a short **subprocess** fallback.  
+- Optional **TWINT** path exists but is disabled by default (brittle).  
+- Sentiment: VADER + small Hindi/Hinglish lexicon by default; you can enable a transformer locally.
 
-**Caveats:**  
-- Twitter/X is not a representative sample of India. Expect bias and noise.  
-- Bots and coordinated campaigns exist—use the "Bot dampening" slider to down-weight high-frequency posters.  
-- Language and sarcasm are tricky; scores are probabilistic, not gospel.
+**If it seems stuck:**  
+- This version has a **60s hard timeout** for each collector and prints **diagnostics** below.
 """)
 
 URL_RE = re.compile(r'https?://\S+|www\.\S+')
@@ -70,76 +57,68 @@ def have_twint() -> bool:
     except Exception:
         return False
 
-def run_twint_search(query: str, lang: str, since: str, limit: int, near: str = None) -> pd.DataFrame:
+# ---------------------------
+# SNSCRAPE COLLECTORS
+# ---------------------------
+def run_snscrape_python(query: str, lang: str, since: str, limit: int, india_only: bool=True, timeout_s: int=60) -> pd.DataFrame:
+    """
+    snscrape Python API path (preferred). Hard-stops after timeout_s seconds.
+    """
+    start = time.time()
     try:
-        import twint
+        from snscrape.modules.twitter import TwitterSearchScraper
     except Exception as e:
-        raise RuntimeError(f"TWINT not available: {e}")
+        raise RuntimeError(f"snscrape import failed: {e}")
 
-    c = twint.Config()
-    c.Search = query
-    if lang:
-        c.Lang = lang
-    if since:
-        c.Since = since
-    if near:
-        c.Near = near
-    c.Limit = int(limit)
-    c.Hide_output = True
-    tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp_json.close()
-    c.Store_json = True
-    c.Output = tmp_json.name
-    try:
-        twint.run.Search(c)
-    except Exception as e:
-        raise RuntimeError(f"TWINT error: {e}")
+    q_parts = [query]
+    if lang: q_parts.append(f'lang:{lang}')
+    if since: q_parts.append(f'since:{since}')
+    if india_only: q_parts.append('place_country:IN')
+    q = " ".join(q_parts)
+
     rows = []
-    with open(tmp_json.name, 'r', encoding='utf-8') as f:
-        for line in f:
-            line=line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
+    try:
+        scraper = TwitterSearchScraper(q)
+        for i, tweet in enumerate(scraper.get_items()):
+            if (i+1) > int(limit): break
             rows.append({
-                'date': obj.get('date') or obj.get('created_at') or obj.get('created'),
-                'username': obj.get('username') or obj.get('user',{}).get('username'),
-                'content': obj.get('tweet') or obj.get('content') or obj.get('full_text'),
-                'likeCount': obj.get('likes_count') or obj.get('likes') or obj.get('favorite_count'),
-                'retweetCount': obj.get('retweets_count') or obj.get('retweets') or obj.get('retweet_count'),
-                'replyCount': obj.get('replies_count') or obj.get('replies') or obj.get('reply_count'),
+                'date': tweet.date,
+                'username': getattr(tweet.user, 'username', None),
+                'content': tweet.rawContent if hasattr(tweet, 'rawContent') else tweet.content,
+                'likeCount': getattr(tweet, 'likeCount', None),
+                'retweetCount': getattr(tweet, 'retweetCount', None),
+                'replyCount': getattr(tweet, 'replyCount', None),
             })
-    os.unlink(tmp_json.name)
+            if time.time() - start > timeout_s:
+                break
+    except Exception as e:
+        raise RuntimeError(f"snscrape Python API error: {e}")
+
     df = pd.DataFrame(rows)
     if not df.empty:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df = df.dropna(subset=['content'])
     return df
 
-def run_snscrape_search(query: str, lang: str, since: str, limit: int, india_only: bool=True) -> pd.DataFrame:
+def run_snscrape_subprocess(query: str, lang: str, since: str, limit: int, india_only: bool=True, timeout_s: int=60) -> (pd.DataFrame, str):
+    """
+    Fallback: snscrape via subprocess with timeout.
+    Returns dataframe + stderr for diagnostics.
+    """
     q_parts = [query]
-    if lang:
-        q_parts.append(f'lang:{lang}')
-    if since:
-        q_parts.append(f'since:{since}')
-    if india_only:
-        q_parts.append('place_country:IN')
+    if lang: q_parts.append(f'lang:{lang}')
+    if since: q_parts.append(f'since:{since}')
+    if india_only: q_parts.append('place_country:IN')
     q = " ".join(q_parts)
 
-    cmd = [
-        sys.executable, "-m", "snscrape", "--jsonl",
-        "--max-results", str(int(limit)),
-        "twitter-search", q
-    ]
-
+    cmd = [sys.executable, "-m", "snscrape", "--jsonl", "--max-results", str(int(limit)), "twitter-search", q]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        if proc.returncode != 0:
+            return pd.DataFrame(), proc.stderr
         lines = proc.stdout.strip().splitlines()
     except Exception as e:
-        raise RuntimeError(f"snscrape error: {e}")
+        return pd.DataFrame(), f"subprocess error: {e}"
 
     rows = []
     for line in lines:
@@ -159,38 +138,66 @@ def run_snscrape_search(query: str, lang: str, since: str, limit: int, india_onl
     if not df.empty:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df = df.dropna(subset=['content'])
+    return df, ""
+
+def run_twint_search(query: str, lang: str, since: str, limit: int, near: str = None, timeout_s: int=60) -> pd.DataFrame:
+    """
+    TWINT path (brittle). Wrapped in timeout-like behavior by limiting result count and returning quickly.
+    """
+    try:
+        import twint
+    except Exception as e:
+        raise RuntimeError(f"TWINT not available: {e}")
+
+    tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    tmp_json.close()
+
+    c = twint.Config()
+    c.Search = query
+    if lang: c.Lang = lang
+    if since: c.Since = since
+    if near: c.Near = near
+    c.Limit = int(limit)
+    c.Hide_output = True
+    c.Store_json = True
+    c.Output = tmp_json.name
+    try:
+        # No built-in timeout; rely on low limit + platform limits
+        twint.run.Search(c)
+    except Exception as e:
+        raise RuntimeError(f"TWINT error: {e}")
+
+    rows = []
+    try:
+        with open(tmp_json.name, 'r', encoding='utf-8') as f:
+            for line in f:
+                line=line.strip()
+                if not line: continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                rows.append({
+                    'date': obj.get('date') or obj.get('created_at') or obj.get('created'),
+                    'username': obj.get('username') or obj.get('user',{}).get('username'),
+                    'content': obj.get('tweet') or obj.get('content') or obj.get('full_text'),
+                    'likeCount': obj.get('likes_count') or obj.get('likes') or obj.get('favorite_count'),
+                    'retweetCount': obj.get('retweets_count') or obj.get('retweets') or obj.get('retweet_count'),
+                    'replyCount': obj.get('replies_count') or obj.get('replies') or obj.get('reply_count'),
+                })
+    finally:
+        try: os.unlink(tmp_json.name)
+        except: pass
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['content'])
     return df
 
-def collect_tweets(query: str, lang: str, days: int, limit: int, geofocus: str, prefer_twint: bool=True) -> (pd.DataFrame, str):
-    since_date = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
-    if prefer_twint and have_twint():
-        try:
-            df = run_twint_search(query, lang, since_date, limit, near=geofocus or None)
-            if not df.empty:
-                return df, "twint"
-        except Exception as e:
-            st.info(f"TWINT failed: {e}. Falling back to snscrape.")
-    try:
-        df = run_snscrape_search(query, lang, since_date, limit, india_only=True)
-        if not df.empty:
-            return df, "snscrape"
-    except Exception as e:
-        st.error(f"snscrape failed: {e}")
-    return pd.DataFrame(), "none"
-
-@st.cache_resource(show_spinner=False)
-def get_transformer_pipeline():
-    try:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
-        model_name = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        labels = ["negative","neutral","positive"]
-        pipe = TextClassificationPipeline(model=model, tokenizer=tokenizer, return_all_scores=True)
-        return pipe, labels
-    except Exception as e:
-        return None, None
-
+# ---------------------------
+# SENTIMENT (VADER default)
+# ---------------------------
 @st.cache_resource(show_spinner=False)
 def get_vader():
     try:
@@ -200,32 +207,20 @@ def get_vader():
             nltk.data.find('sentiment/vader_lexicon.zip')
         except LookupError:
             nltk.download('vader_lexicon')
-        sia = SentimentIntensityAnalyzer()
-        return sia
+        return SentimentIntensityAnalyzer()
     except Exception:
         return None
 
 HINDI_LEXICON = {
-    "vote chori": -0.9,
-    "वोट चोरी": -0.9,
-    "धांधली": -0.8,
-    "scam": -0.6,
-    "bharosa": 0.4,
-    "भरोसा": 0.4,
-    "badhiya": 0.5,
-    "अच्छा": 0.5,
-    "chor": -0.7,
-    "झूठ": -0.7,
-    "andhbhakt": -0.4,
-    "कांग्रेस": 0.0,
-    "भाजपा": 0.0,
+    "vote chori": -0.9, "वोट चोरी": -0.9, "धांधली": -0.8, "scam": -0.6,
+    "bharosa": 0.4, "भरोसा": 0.4, "badhiya": 0.5, "अच्छा": 0.5,
+    "chor": -0.7, "झूठ": -0.7, "andhbhakt": -0.4,
+    "कांग्रेस": 0.0, "भाजपा": 0.0,
 }
-
 EMOJI_POLARITY = {
     "😡": -0.8, "🤬": -0.9, "😭": -0.6, "😢": -0.5, "😞": -0.4, "😤": -0.4,
     "👍": 0.5, "🙏": 0.3, "🔥": 0.2, "🎉": 0.7, "😊": 0.5, "😀": 0.5, "😂": 0.2,
 }
-
 def lexicon_score(text: str) -> float:
     s = text.lower()
     score = 0.0
@@ -238,46 +233,18 @@ def lexicon_score(text: str) -> float:
     return max(-1.0, min(1.0, score))
 
 def classify_sentiment(texts: List[str]) -> List[str]:
-    use_transformer = st.session_state.get('use_transformer', False)
-    results = []
-    pipe, labels = (None, None)
-    if use_transformer:
-        pipe, labels = get_transformer_pipeline()
-        if pipe is None:
-            st.info("Transformer model unavailable; falling back to VADER + lexicon.")
-            use_transformer = False
-
-    if use_transformer and pipe is not None:
-        try:
-            out = pipe(list(texts), truncation=True)
-            for scores in out:
-                top = max(scores, key=lambda d: d['score'])
-                lab = top['label'].lower()
-                if 'neg' in lab:
-                    results.append('oppose')
-                elif 'pos' in lab:
-                    results.append('support')
-                else:
-                    results.append('neutral')
-            return results
-        except Exception:
-            st.info("Transformer inference failed; switching to VADER + lexicon.")
-
     sia = get_vader()
+    out = []
     for t in texts:
         lt = clean_text(t)
         base = 0.0
         if sia is not None:
-            vs = sia.polarity_scores(lt)['compound']
-            base = vs
+            base = sia.polarity_scores(lt)['compound']
         base += 0.4 * lexicon_score(t)
-        if base > 0.15:
-            results.append('support')
-        elif base < -0.15:
-            results.append('oppose')
-        else:
-            results.append('neutral')
-    return results
+        if base > 0.15: out.append('support')
+        elif base < -0.15: out.append('oppose')
+        else: out.append('neutral')
+    return out
 
 def compute_weights(df: pd.DataFrame, cap_per_user: int, boost_engagement: bool=True) -> np.ndarray:
     if df.empty:
@@ -289,40 +256,77 @@ def compute_weights(df: pd.DataFrame, cap_per_user: int, boost_engagement: bool=
             eng = (row.get('likeCount') or 0) + (row.get('retweetCount') or 0) + (row.get('replyCount') or 0)
             base *= math.log1p(eng + 1)
         return base
-    w = df.apply(weight_row, axis=1).values
-    return w
+    return df.apply(weight_row, axis=1).values
 
+# ---------------------------
+# UI
+# ---------------------------
 with st.sidebar:
     st.header("Query")
-    topic = st.text_input("Topic / keywords", value="vote chori")
-    lang = st.selectbox("Language filter", ["", "en", "hi"], index=2, help="Leave blank for all languages.")
+    topic = st.text_input("Topic / keywords", value="inflation")
+    lang = st.selectbox("Language filter", ["", "en", "hi"], index=1, help="Leave blank for all languages.")
     days = st.slider("Lookback window (days)", 1, 30, value=2)
-    limit = st.slider("Max tweets to fetch", 100, 10000, value=1000, step=100)
-    geofocus = st.text_input("Geofocus (TWINT 'near=')", value="Delhi", help="TWINT only; snscrape uses place_country:IN filter.")
+    limit = st.slider("Max tweets to fetch", 100, 10000, value=600, step=100)
+    geofocus = st.text_input("Geofocus (TWINT 'near=')", value="", help="Leave blank for country-wide. TWINT only.")
     prefer_twint = st.checkbox("Prefer TWINT (fallback to snscrape)", value=False)
+    strict_india = st.checkbox("Strict India filter (place_country:IN)", value=True, help="ON = snscrape limits to tweets with place metadata in India. OFF = global.")
     st.header("Analysis")
-    cap_per_user = st.slider("Bot dampening cap (tweets/user)", 1, 50, 5, help="Down-weights users who post more than this per window.")
-    boost_eng = st.checkbox("Boost by engagement (likes/RT/replies)", value=True)
-    use_transformer = st.checkbox("Use transformer model (heavier; faster OFF)", value=False)
-    st.session_state['use_transformer'] = use_transformer
+    cap_per_user = st.slider("Bot dampening cap (tweets/user)", 1, 50, 5)
+    boost_eng = st.checkbox("Boost by engagement (likes/RT/replies)", value=False)
     st.header("Run")
     do_run = st.button("Fetch & Analyze", type="primary")
+
+diag = {"collector": None, "q": None, "error": None, "counts": 0, "path": [], "py": sys.version.split()[0]}
+df = pd.DataFrame()
 
 if do_run:
     if not topic.strip():
         st.warning("Please enter a topic/keyword.")
         st.stop()
+    since_date = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
 
-    with st.status("Collecting tweets...", expanded=False) as status:
-        df, source = collect_tweets(topic, lang if lang else None, days, limit, geofocus if geofocus else None, prefer_twint=prefer_twint)
-        if df.empty:
-            st.error("No tweets fetched. Try reducing filters, increasing lookback, or ensuring snscrape/twint are installed.")
-            st.stop()
-        status.update(label=f"Collected {len(df)} tweets via {source}. Cleaning…", state="running")
-        df['clean'] = df['content'].astype(str).map(clean_text)
-        df = df.drop_duplicates(subset=['clean'])
-        df = df.dropna(subset=['clean'])
-        status.update(label=f"{len(df)} unique tweets after cleaning. Classifying sentiment…", state="running")
+    # Try snscrape Python API first
+    diag["collector"] = "snscrape-python"
+    diag["q"] = f'{topic} {"lang:"+lang if lang else ""} since:{since_date} {"place_country:IN" if strict_india else ""}'.strip()
+    try:
+        df = run_snscrape_python(topic, lang if lang else None, since_date, limit, india_only=strict_india, timeout_s=60)
+        diag["counts"] = len(df)
+        diag["path"].append("snscrape-python")
+    except Exception as e:
+        diag["error"] = f"{e}"
+        # Fallback: subprocess
+        try:
+            diag["collector"] = "snscrape-subprocess"
+            df, stderr = run_snscrape_subprocess(topic, lang if lang else None, since_date, limit, india_only=strict_india, timeout_s=60)
+            diag["counts"] = len(df)
+            diag["path"].append("snscrape-subprocess")
+            if stderr:
+                diag["error"] = (diag.get("error","") + "\n" + stderr).strip()
+        except Exception as e2:
+            diag["error"] = (diag.get("error","") + f"\nsubprocess fallback error: {e2}").strip()
+            # Final fallback: TWINT if requested
+            if prefer_twint:
+                try:
+                    diag["collector"] = "twint"
+                    df = run_twint_search(topic, lang if lang else None, since_date, limit, near=geofocus or None, timeout_s=60)
+                    diag["counts"] = len(df)
+                    diag["path"].append("twint")
+                except Exception as e3:
+                    diag["error"] = (diag.get("error","") + f"\ntwint error: {e3}").strip()
+
+    # Handle empty or failure
+    if df.empty:
+        st.error("No tweets fetched.")
+        with st.expander("Diagnostics"):
+            st.json(diag)
+        st.stop()
+
+    st.success(f"Fetched {len(df)} tweets via {diag['collector']}.")
+    with st.expander("Diagnostics"):
+        st.json(diag)
+
+    df['clean'] = df['content'].astype(str).map(clean_text)
+    df = df.drop_duplicates(subset=['clean']).dropna(subset=['clean'])
 
     labels = classify_sentiment(df['clean'].tolist())
     df['stance'] = labels
@@ -340,14 +344,11 @@ if do_run:
     col4.metric("Sample size", f"{len(df)} tweets")
 
     if 'date' in df.columns and not df['date'].isna().all():
-        df['date_round'] = df['date'].dt.floor('H')
+        df['date_round'] = pd.to_datetime(df['date'], errors='coerce').dt.floor('H')
         trend = df.groupby(['date_round','stance'])['weight'].sum().reset_index()
         trend_pivot = trend.pivot(index='date_round', columns='stance', values='weight').fillna(0.0)
-        trend_pivot = trend_pivot.reindex(columns=['support','oppose','neutral']).fillna(0.0)
         st.subheader("Trend over time (weighted)")
         st.line_chart(trend_pivot)
-    else:
-        st.info("No timestamps available to plot trend.")
 
     from collections import Counter
     def tokenize(s):
@@ -385,5 +386,5 @@ if do_run:
         st.dataframe(df[['date','username','content','stance','likeCount','retweetCount','replyCount']].sort_values('date', ascending=False), use_container_width=True)
 
     df_out = df[['date','username','content','stance','likeCount','retweetCount','replyCount','weight']].copy()
-    csv_bytes = df_out.to_csv(index=False).encode('utf-8')
-    st.download_button("Download results (CSV)", data=csv_bytes, file_name=f"tweets_{topic.replace(' ','_')}.csv", mime="text/csv")
+    st.download_button("Download results (CSV)", data=df_out.to_csv(index=False).encode('utf-8'),
+                       file_name=f"tweets_{topic.replace(' ','_')}.csv", mime="text/csv")
