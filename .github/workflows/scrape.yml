@@ -28,6 +28,13 @@ jobs:
     permissions:
       contents: write
 
+    # One place for defaults (works for schedule + manual).
+    env:
+      TOPICS: ${{ github.event.inputs.topics || 'vote chori, stock market' }}
+      LANG:   ${{ github.event.inputs.lang   || 'en' }}
+      DAYS:   ${{ github.event.inputs.days   || '2' }}
+      LIMIT:  ${{ github.event.inputs.limit  || '800' }}
+
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v4
@@ -38,17 +45,6 @@ jobs:
         run: |
           ls -la
           test -f scrape.py || (echo "scrape.py not found at repo root" && exit 1)
-
-      - name: Set defaults from inputs
-        run: |
-          echo "TOPICS=${{ github.event.inputs.topics }}" >> $GITHUB_ENV
-          echo "LANG=${{ github.event.inputs.lang }}" >> $GITHUB_ENV
-          echo "DAYS=${{ github.event.inputs.days }}" >> $GITHUB_ENV
-          echo "LIMIT=${{ github.event.inputs.limit }}" >> $GITHUB_ENV
-          echo 'TOPICS=${TOPICS:-vote chori, stock market}' >> $GITHUB_ENV
-          echo 'LANG=${LANG:-en}' >> $GITHUB_ENV
-          echo 'DAYS=${DAYS:-2}' >> $GITHUB_ENV
-          echo 'LIMIT=${LIMIT:-800}' >> $GITHUB_ENV
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
