@@ -1,78 +1,87 @@
+name: scrape-twitter-topics
 
-import sys, argparse, traceback
-from datetime import datetime, timedelta
-import pandas as pd
+on:
+  workflow_dispatch:
+    inputs:
+      topics:
+        description: "Comma-separated topics"
+        required: false
+        default: "vote chori, stock market"
+      lang:
+        description: "Language filter"
+        required: false
+        default: "en"
+      days:
+        description: "Lookback days"
+        required: false
+        default: "2"
+      limit:
+        description: "Max tweets"
+        required: false
+        default: "800"
+  schedule:
+    - cron: "0 * * * *"   # hourly
 
-def log(msg):
-    print(f"[scrape] {msg}", flush=True)
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-def run_snscrape_python(query: str, lang: str, since: str, limit: int) -> pd.DataFrame:
-    try:
-        from snscrape.modules.twitter import TwitterSearchScraper
-    except Exception as e:
-        log(f"ERROR: snscrape import failed: {e}")
-        raise
-    q_parts = [query]
-    if lang: q_parts.append(f'lang:{lang}')
-    if since: q_parts.append(f'since:{since}')
-    q = " ".join(q_parts)
-    log(f"Query => {q}")
-    rows=[]
-    try:
-        for i, tw in enumerate(TwitterSearchScraper(q).get_items()):
-            rows.append({
-                "date": getattr(tw, "date", None),
-                "username": getattr(getattr(tw, "user", None), "username", None),
-                "content": getattr(tw, "rawContent", getattr(tw, "content", "")),
-                "likeCount": getattr(tw, "likeCount", 0),
-                "retweetCount": getattr(tw, "retweetCount", 0),
-                "replyCount": getattr(tw, "replyCount", 0),
-            })
-            if (i+1)>=int(limit): break
-    except Exception as e:
-        log(f"ERROR: scraping loop failed: {e}")
-        raise
-    df=pd.DataFrame(rows)
-    if not df.empty:
-        df["date"]=pd.to_datetime(df["date"], errors="coerce")
-        df=df.dropna(subset=["content"])
-    log(f"Fetched rows: {len(df)}")
-    return df
+      - name: Verify script exists
+        run: |
+          ls -la
+          test -f scrape.py || (echo "scrape.py not found at repo root" && exit 1)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--topics", type=str, default="vote chori, stock market")
-    ap.add_argument("--lang", type=str, default="en")
-    ap.add_argument("--days", type=int, default=2)
-    ap.add_argument("--limit", type=int, default=800)
-    ap.add_argument("--outdir", type=str, default="data")
-    args = ap.parse_args()
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    since_date = (datetime.utcnow() - timedelta(days=args.days)).date().isoformat()
-    topics=[t.strip() for t in args.topics.split(",") if t.strip()]
-    import os
-    os.makedirs(args.outdir, exist_ok=True)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "snscrape==0.7.0.20230622" pandas
 
-    any_written = False
-    for topic in topics:
-        try:
-            df = run_snscrape_python(topic, args.lang or None, since_date, args.limit)
-        except Exception:
-            traceback.print_exc()
-            sys.exit(2)
-        safe = "_".join(topic.lower().split())
-        stamp = datetime.utcnow().strftime("%Y%m%d")
-        path_daily = os.path.join(args.outdir, f"{safe}_{stamp}.csv")
-        path_latest = os.path.join(args.outdir, f"latest_{safe}.csv")
-        df.to_csv(path_daily, index=False, encoding="utf-8")
-        df.to_csv(path_latest, index=False, encoding="utf-8")
-        log(f"Wrote {len(df)} rows for '{topic}' -> {path_daily} and {path_latest}")
-        any_written = True
+      - name: Debug environment
+        run: |
+          python -V
+          pip -V
+          python -c "import snscrape, pandas; print('snscrape OK', snscrape.__version__); print('pandas OK', pandas.__version__)"
 
-    if not any_written:
-        log("ERROR: Nothing written.")
-        sys.exit(3)
+      - name: Run scrape on default branch
+        run: |
+          python scrape.py \
+            --topics "${{ github.event.inputs.topics || 'vote chori, stock market' }}" \
+            --lang "${{ github.event.inputs.lang || 'en' }}" \
+            --days "${{ github.event.inputs.days || '2' }}" \
+            --limit "${{ github.event.inputs.limit || '800' }}" \
+            --outdir data
 
-if __name__ == "__main__":
-    import pandas as pd
-    main()
+      - name: Stage outputs aside
+        run: |
+          ls -lh data || true
+          mkdir -p /tmp/out
+          cp -r data /tmp/out/data
+
+      - name: Switch to/create data-cache branch
+        run: |
+          git fetch origin data-cache || true
+          git checkout data-cache || git checkout -b data-cache
+
+      - name: Copy outputs into data-cache and commit
+        run: |
+          mkdir -p data
+          cp -r /tmp/out/data/* data/ || true
+          ls -lh data || true
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.csv || true
+          git commit -m "Update scraped CSVs [skip ci]" || echo "Nothing to commit"
+          git pull --rebase origin data-cache || true
+          git push origin HEAD:data-cache
