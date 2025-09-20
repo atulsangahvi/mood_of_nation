@@ -1,6 +1,6 @@
 
-# mood_of_india_streamlit.py
-# Robust build: auto-installs snscrape (compatible versions), then uses Python API with subprocess fallback + diagnostics.
+# mood_of_india_streamlit.py (hotfix: diagnostics error concat)
+# Only the diagnostics dict init and error concatenations changed to avoid NoneType + str.
 
 import os
 import re
@@ -50,35 +50,21 @@ def clean_text(s: str) -> str:
     s = WHITESPACE_RE.sub(' ', s).strip()
     return s
 
-# ---------------------------
-# Ensure snscrape is present
-# ---------------------------
 def _pip_install(args, timeout=180):
     proc = subprocess.run([sys.executable, "-m", "pip"] + args,
                           capture_output=True, text=True, timeout=timeout)
     return proc.returncode, (proc.stdout or "") + "\n" + (proc.stderr or "")
 
 def ensure_snscrape(diag: dict) -> str:
-    """
-    Tries to import snscrape; if missing, tries:
-      1) pip install --upgrade pip (once)
-      2) pip install snscrape
-      3) pip install snscrape==0.7.0.20230622
-    Returns "" on success, or an error string.
-    """
     try:
         import snscrape  # noqa: F401
         return ""
     except Exception:
         pass
-
-    # 1) Upgrade pip (best-effort)
     rc, log = _pip_install(["install", "--upgrade", "pip"], timeout=120)
     diag["pip_upgrade_rc"] = rc
     if log.strip():
-        diag["pip_upgrade_log"] = log[-2000:]  # last 2k chars
-
-    # 2) Try unpinned snscrape
+        diag["pip_upgrade_log"] = log[-2000:]
     rc, log = _pip_install(["install", "snscrape"], timeout=180)
     diag["pip_snscrape_unpinned_rc"] = rc
     if log.strip():
@@ -89,8 +75,6 @@ def ensure_snscrape(diag: dict) -> str:
             return ""
         except Exception as e:
             diag["snscrape_import_after_unpinned"] = str(e)
-
-    # 3) Try pinned known-good
     rc, log = _pip_install(["install", "snscrape==0.7.0.20230622"], timeout=180)
     diag["pip_snscrape_pinned_rc"] = rc
     if log.strip():
@@ -101,28 +85,19 @@ def ensure_snscrape(diag: dict) -> str:
             return ""
         except Exception as e:
             return f"import after pinned install failed: {e}"
-
     return "pip install snscrape failed (both unpinned and pinned). See Diagnostics for logs."
 
-# ---------------------------
-# SNSCRAPE COLLECTORS
-# ---------------------------
 def run_snscrape_python(query: str, lang: str, since: str, limit: int, india_only: bool=True, timeout_s: int=60) -> pd.DataFrame:
-    """
-    snscrape Python API path (preferred). Hard-stops after timeout_s seconds.
-    """
     start = time.time()
     try:
         from snscrape.modules.twitter import TwitterSearchScraper
     except Exception as e:
         raise RuntimeError(f"snscrape import failed: {e}")
-
     q_parts = [query]
     if lang: q_parts.append(f'lang:{lang}')
     if since: q_parts.append(f'since:{since}')
     if india_only: q_parts.append('place_country:IN')
     q = " ".join(q_parts)
-
     rows = []
     try:
         scraper = TwitterSearchScraper(q)
@@ -140,7 +115,6 @@ def run_snscrape_python(query: str, lang: str, since: str, limit: int, india_onl
                 break
     except Exception as e:
         raise RuntimeError(f"snscrape Python API error: {e}")
-
     df = pd.DataFrame(rows)
     if not df.empty:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -148,16 +122,11 @@ def run_snscrape_python(query: str, lang: str, since: str, limit: int, india_onl
     return df
 
 def run_snscrape_subprocess(query: str, lang: str, since: str, limit: int, india_only: bool=True, timeout_s: int=60) -> (pd.DataFrame, str):
-    """
-    Fallback: snscrape via subprocess with timeout.
-    Returns dataframe + stderr for diagnostics.
-    """
     q_parts = [query]
     if lang: q_parts.append(f'lang:{lang}')
     if since: q_parts.append(f'since:{since}')
     if india_only: q_parts.append('place_country:IN')
     q = " ".join(q_parts)
-
     cmd = [sys.executable, "-m", "snscrape", "--jsonl", "--max-results", str(int(limit)), "twitter-search", q]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
@@ -166,7 +135,6 @@ def run_snscrape_subprocess(query: str, lang: str, since: str, limit: int, india
         lines = proc.stdout.strip().splitlines()
     except Exception as e:
         return pd.DataFrame(), f"subprocess error: {e}"
-
     rows = []
     for line in lines:
         try:
@@ -187,9 +155,6 @@ def run_snscrape_subprocess(query: str, lang: str, since: str, limit: int, india
         df = df.dropna(subset=['content'])
     return df, ""
 
-# ---------------------------
-# SENTIMENT (VADER default)
-# ---------------------------
 @st.cache_resource(show_spinner=False)
 def get_vader():
     try:
@@ -250,9 +215,6 @@ def compute_weights(df: pd.DataFrame, cap_per_user: int, boost_engagement: bool=
         return base
     return df.apply(weight_row, axis=1).values
 
-# ---------------------------
-# UI
-# ---------------------------
 with st.sidebar:
     st.header("Query")
     topic = st.text_input("Topic / keywords", value="vote chori")
@@ -266,7 +228,8 @@ with st.sidebar:
     st.header("Run")
     do_run = st.button("Fetch & Analyze", type="primary")
 
-diag = {"collector": None, "q": None, "error": None, "counts": 0, "path": [], "py": sys.version.split()[0]}
+# Initialize diagnostics with empty error string (not None)
+diag = {"collector": None, "q": None, "error": "", "counts": 0, "path": [], "py": sys.version.split()[0]}
 df = pd.DataFrame()
 
 if do_run:
@@ -278,7 +241,7 @@ if do_run:
     # Ensure snscrape is available (auto-install if needed)
     install_err = ensure_snscrape(diag)
     if install_err:
-        diag["error"] = (diag.get("error","") + f"\n{install_err}").strip()
+        diag["error"] = (diag.get("error") or "") + f"\n{install_err}"
 
     # Try snscrape Python API
     diag["collector"] = "snscrape-python"
@@ -288,19 +251,18 @@ if do_run:
         diag["counts"] = len(df)
         diag["path"].append("snscrape-python")
     except Exception as e:
-        diag["error"] = (diag.get("error","") + f"\n{e}").strip()
-        # Fallback: subprocess (also needs snscrape installed)
+        diag["error"] = (diag.get("error") or "") + f"\n{e}"
+        # Fallback: subprocess
         try:
             diag["collector"] = "snscrape-subprocess"
             df, stderr = run_snscrape_subprocess(topic, lang if lang else None, since_date, limit, india_only=strict_india, timeout_s=60)
             diag["counts"] = len(df)
             diag["path"].append("snscrape-subprocess")
             if stderr:
-                diag["error"] = (diag.get("error","") + "\n" + stderr).strip()
+                diag["error"] = (diag.get("error") or "") + "\n" + stderr
         except Exception as e2:
-            diag["error"] = (diag.get("error","") + f"\nsubprocess fallback error: {e2}").strip()
+            diag["error"] = (diag.get("error") or "") + f"\nsubprocess fallback error: {e2}"
 
-    # Handle empty or failure
     if df.empty:
         st.error("No tweets fetched.")
         with st.expander("Diagnostics"):
